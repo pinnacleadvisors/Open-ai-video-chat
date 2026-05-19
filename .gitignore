@@ -13,6 +13,7 @@ node_modules/
 out/
 .turbo/
 *.log
+*.tsbuildinfo
 
 # Models / checkpoints
 models/checkpoints/

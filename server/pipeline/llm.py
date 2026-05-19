@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Optional
 
 import httpx
 from loguru import logger
@@ -18,6 +19,8 @@ class Message:
 
 @dataclass
 class ChatState:
+    """Conversation history with a system prompt. Pure data — no I/O."""
+
     system_prompt: str
     history: list[Message] = field(default_factory=list)
     max_history: int = 24
@@ -29,38 +32,43 @@ class ChatState:
         return msgs
 
     def add_user(self, text: str) -> None:
-        self.history.append(Message("user", text))
+        text = text.strip()
+        if text:
+            self.history.append(Message("user", text))
 
     def add_assistant(self, text: str) -> None:
+        text = (text or "").strip()
         if text:
             self.history.append(Message("assistant", text))
 
+    def reset(self) -> None:
+        self.history.clear()
 
-class LLM:
-    """Streaming chat client. Supports Ollama and any OpenAI-compatible endpoint."""
 
-    def __init__(self, settings: Settings):
+class LLMSession:
+    """Per-conversation streaming chat client. Shares the http client via engine."""
+
+    def __init__(self, settings: Settings, http: httpx.AsyncClient, session_id: str):
         self.settings = settings
+        self.http = http
+        self.session_id = session_id
         self.state = ChatState(system_prompt=settings.llm_system_prompt)
-        self._cancel: Optional[asyncio.Event] = None
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
+        self._cancel: asyncio.Event | None = None
 
     def update_system_prompt(self, prompt: str) -> None:
         self.state.system_prompt = prompt
 
     def reset(self) -> None:
-        self.state.history.clear()
+        self.state.reset()
 
     def cancel(self) -> None:
         if self._cancel is not None:
             self._cancel.set()
 
     async def stream_reply(self, user_text: str) -> AsyncIterator[str]:
-        """Stream the assistant reply token-by-token. Honors cancellation."""
         self.state.add_user(user_text)
         self._cancel = asyncio.Event()
         chunks: list[str] = []
-
         try:
             if self.settings.llm_backend == "ollama":
                 stream = self._stream_ollama()
@@ -68,7 +76,7 @@ class LLM:
                 stream = self._stream_openai()
             async for tok in stream:
                 if self._cancel.is_set():
-                    logger.info("llm reply cancelled (barge-in)")
+                    logger.bind(session=self.session_id).info("llm reply cancelled")
                     break
                 chunks.append(tok)
                 yield tok
@@ -77,8 +85,6 @@ class LLM:
             self._cancel = None
 
     async def _stream_ollama(self) -> AsyncIterator[str]:
-        import json
-
         url = self.settings.llm_base_url.rstrip("/") + "/api/chat"
         payload = {
             "model": self.settings.llm_model,
@@ -89,7 +95,7 @@ class LLM:
                 "num_predict": self.settings.llm_max_tokens,
             },
         }
-        async with self._client.stream("POST", url, json=payload) as r:
+        async with self.http.stream("POST", url, json=payload) as r:
             r.raise_for_status()
             async for line in r.aiter_lines():
                 if not line:
@@ -100,8 +106,7 @@ class LLM:
                     continue
                 if data.get("done"):
                     break
-                msg = data.get("message") or {}
-                content = msg.get("content") or ""
+                content = (data.get("message") or {}).get("content") or ""
                 if content:
                     yield content
 
@@ -123,6 +128,3 @@ class LLM:
             delta = chunk.choices[0].delta.content if chunk.choices else None
             if delta:
                 yield delta
-
-    async def close(self) -> None:
-        await self._client.aclose()

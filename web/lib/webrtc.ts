@@ -1,3 +1,5 @@
+import { getAuthToken } from "./api";
+
 export type CallHandle = {
   pc: RTCPeerConnection;
   sessionId: string;
@@ -5,9 +7,14 @@ export type CallHandle = {
   stop: () => Promise<void>;
 };
 
-export async function startCall(): Promise<CallHandle> {
+export type CallOptions = {
+  personaId?: string;
+  iceServers?: RTCIceServer[];
+};
+
+export async function startCall(opts: CallOptions = {}): Promise<CallHandle> {
   const pc = new RTCPeerConnection({
-    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    iceServers: opts.iceServers ?? [{ urls: "stun:stun.l.google.com:19302" }],
   });
 
   const remoteStream = new MediaStream();
@@ -27,21 +34,26 @@ export async function startCall(): Promise<CallHandle> {
   });
   mic.getAudioTracks().forEach((t) => pc.addTrack(t, mic));
 
-  // Receive avatar audio + video
   pc.addTransceiver("video", { direction: "recvonly" });
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-
-  // Wait for ICE gathering to finish (trickle disabled for simplicity)
   await waitForIceComplete(pc);
+
+  const token = getAuthToken();
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
 
   const resp = await fetch("/api/webrtc/offer", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sdp: pc.localDescription!.sdp, type: pc.localDescription!.type }),
+    headers,
+    body: JSON.stringify({
+      sdp: pc.localDescription!.sdp,
+      type: pc.localDescription!.type,
+      persona_id: opts.personaId,
+    }),
   });
-  if (!resp.ok) throw new Error(`offer rejected: ${resp.status}`);
+  if (!resp.ok) throw new Error(`offer rejected: ${resp.status} ${await resp.text()}`);
   const answer = await resp.json();
   await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type });
 
@@ -53,7 +65,7 @@ export async function startCall(): Promise<CallHandle> {
       mic.getTracks().forEach((t) => t.stop());
       pc.close();
       try {
-        await fetch(`/api/webrtc/${answer.id}`, { method: "DELETE" });
+        await fetch(`/api/webrtc/${answer.id}`, { method: "DELETE", headers });
       } catch {
         // ignore
       }
