@@ -1,11 +1,26 @@
 from __future__ import annotations
 
+import asyncio
+import os
 import sys
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Response, UploadFile, WebSocket, WebSocketDisconnect
+# Pipeline / WebRTC / virtual-cam imports pull in cv2/torch/aiortc; do them
+# lazily inside the handlers so this module loads in lightweight envs (tests).
+from typing import TYPE_CHECKING
+
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
@@ -14,12 +29,19 @@ from pydantic import BaseModel
 from .auth import BearerTokenMiddleware
 from .config import Settings, get_settings
 from .engines import Engines
+from .health_probes import run_probes
+from .lifecycle import graceful_drain
 from .metrics import metrics
+from .middleware import RequestIdMiddleware, SecurityHeadersMiddleware
 from .personas_store import Persona, PersonaStore
-from .pipeline import AvatarSession, LLMSession, Orchestrator, STTSession, TTSSession
+from .rate_limit import TokenBucket
+from .rate_limit import enforce as enforce_rate
 from .utils.uploads import save_upload
-from .virtual_camera import VirtualCameraPublisher
-from .webrtc.session import WebRTCSession
+
+if TYPE_CHECKING:
+    from .pipeline import Orchestrator
+    from .virtual_camera import VirtualCameraPublisher
+    from .webrtc.session import WebRTCSession
 
 
 class _AppState:
@@ -28,6 +50,8 @@ class _AppState:
     personas: PersonaStore
     virtual_camera: VirtualCameraPublisher
     sessions: dict[str, WebRTCSession]
+    offer_bucket: TokenBucket
+    upload_bucket: TokenBucket
 
     def __init__(self) -> None:
         self.sessions = {}
@@ -45,14 +69,16 @@ def _configure_logging(settings: Settings) -> None:
             "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> "
             "<level>{level: <8}</level> "
             "<cyan>{extra[session]:<8}</cyan> "
+            "<dim>{extra[request_id]:<12}</dim> "
             "<level>{message}</level>"
         ),
-        filter=_inject_default_session,
+        filter=_inject_defaults,
     )
 
 
-def _inject_default_session(record) -> bool:  # type: ignore[no-untyped-def]
+def _inject_defaults(record) -> bool:  # type: ignore[no-untyped-def]
     record["extra"].setdefault("session", "-")
+    record["extra"].setdefault("request_id", "-")
     return True
 
 
@@ -66,34 +92,50 @@ async def lifespan(app: FastAPI):
     (settings.media_dir / "personas").mkdir(parents=True, exist_ok=True)
     settings.data_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("loading engines (this may take a minute)")
-    state.engines = Engines(settings)
-    state.engines.load()
+    from .virtual_camera import VirtualCameraPublisher
 
+    state.engines = Engines(settings)
     state.personas = PersonaStore(settings.data_dir / "personas.db")
     state.virtual_camera = VirtualCameraPublisher(settings)
+    state.offer_bucket = TokenBucket(
+        rate=settings.rate_limit_offer_per_min / 60.0,
+        capacity=settings.rate_limit_offer_per_min,
+    )
+    state.upload_bucket = TokenBucket(
+        rate=settings.rate_limit_upload_per_min / 60.0,
+        capacity=settings.rate_limit_upload_per_min,
+    )
+
+    if os.environ.get("OAVC_SKIP_ENGINES") != "1":
+        logger.info("loading engines (this may take a minute)")
+        state.engines.load()
 
     yield
 
-    logger.info("shutting down")
-    for s in list(state.sessions.values()):
-        await s.close()
+    logger.info("shutdown beginning, draining sessions")
+    await graceful_drain(_close_all_sessions, timeout=settings.shutdown_drain_s)
     await state.virtual_camera.stop()
     await state.engines.close()
+    logger.info("shutdown complete")
+
+
+async def _close_all_sessions() -> None:
+    sessions = list(state.sessions.values())
+    state.sessions.clear()
+    if not sessions:
+        return
+    await asyncio.gather(*(s.close() for s in sessions), return_exceptions=True)
 
 
 app = FastAPI(title="open-ai-video-chat", lifespan=lifespan)
 
 
-@app.middleware("http")
-async def _log_requests(request, call_next):  # type: ignore[no-untyped-def]
-    response = await call_next(request)
-    return response
-
-
 def _install_middleware() -> None:
     settings = get_settings()
-    app.add_middleware(BearerTokenMiddleware, token=settings.auth_token)
+    # Middleware runs in *reverse* registration order. We want, on the way IN:
+    #   RequestId -> Auth -> CORS -> SecurityHeaders -> app
+    # So register them inner-first (outer-last):
+    app.add_middleware(SecurityHeadersMiddleware, hsts=settings.enable_hsts)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list() or ["*"],
@@ -101,9 +143,19 @@ def _install_middleware() -> None:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(BearerTokenMiddleware, token=lambda: get_settings().auth_token)
+    app.add_middleware(RequestIdMiddleware)
 
 
 _install_middleware()
+
+
+def _rl_offer(request: Request) -> None:
+    enforce_rate(state.offer_bucket, request)
+
+
+def _rl_upload(request: Request) -> None:
+    enforce_rate(state.upload_bucket, request)
 
 
 # ---------- health / metrics --------------------------------------------------
@@ -124,10 +176,10 @@ async def health() -> dict:
 
 @app.get("/api/ready")
 async def ready() -> JSONResponse:
-    """Readiness: engines loaded AND at least one persona reachable."""
-    if not hasattr(state, "engines") or state.engines.whisper is None:
-        return JSONResponse({"status": "loading"}, status_code=503)
-    return JSONResponse({"status": "ready"})
+    engines_ready = hasattr(state, "engines") and state.engines.whisper is not None
+    report = await run_probes(state.settings, state.engines.http, engines_ready=engines_ready)
+    code = 200 if report.ready else 503
+    return JSONResponse(report.to_dict(), status_code=code)
 
 
 @app.get("/api/metrics")
@@ -150,7 +202,7 @@ async def list_personas() -> list[dict]:
     return [p.__dict__ for p in state.personas.list()]
 
 
-@app.post("/api/personas")
+@app.post("/api/personas", dependencies=[Depends(_rl_upload)])
 async def create_persona(
     file: UploadFile,
     name: str,
@@ -169,7 +221,7 @@ async def create_persona(
     persona = Persona(
         id=persona_id,
         name=name,
-        image_path=str(image_path.relative_to(state.settings.root_dir)),
+        image_path=str(image_path),  # absolute on disk
         voice=voice,
         speaker_wav=speaker_wav,
         system_prompt=system_prompt,
@@ -183,7 +235,7 @@ async def delete_persona(persona_id: str) -> dict:
     return {"deleted": state.personas.delete(persona_id)}
 
 
-@app.post("/api/persona/voice")
+@app.post("/api/persona/voice", dependencies=[Depends(_rl_upload)])
 async def upload_voice_sample(file: UploadFile) -> dict:
     dst = save_upload(
         file,
@@ -192,7 +244,7 @@ async def upload_voice_sample(file: UploadFile) -> dict:
         kind="audio",
         max_bytes=state.settings.max_audio_upload_mb * (1 << 20),
     )
-    return {"path": str(dst.relative_to(state.settings.root_dir))}
+    return {"path": str(dst)}
 
 
 # ---------- voices ------------------------------------------------------------
@@ -213,6 +265,8 @@ class OfferBody(BaseModel):
 
 
 def _make_orchestrator(persona: Persona | None) -> Orchestrator:
+    from .pipeline import AvatarSession, LLMSession, Orchestrator, STTSession, TTSSession
+
     settings = state.settings
     engines = state.engines
     session_id = uuid.uuid4().hex[:8]
@@ -238,14 +292,15 @@ def _make_orchestrator(persona: Persona | None) -> Orchestrator:
 async def _load_persona_image(orch: Orchestrator, persona: Persona | None) -> None:
     image_path: Path | None = None
     if persona:
-        image_path = state.settings.root_dir / persona.image_path
+        candidate = Path(persona.image_path)
+        image_path = candidate if candidate.is_absolute() else state.settings.root_dir / candidate
     elif state.settings.avatar_path().exists():
         image_path = state.settings.avatar_path()
     if image_path and image_path.exists():
         await orch.avatar.load_persona(image_path)
 
 
-@app.post("/api/webrtc/offer")
+@app.post("/api/webrtc/offer", dependencies=[Depends(_rl_offer)])
 async def webrtc_offer(body: OfferBody) -> JSONResponse:
     if len(state.sessions) >= state.settings.max_sessions:
         metrics.webrtc_negotiation_failures_total.inc()
@@ -253,23 +308,30 @@ async def webrtc_offer(body: OfferBody) -> JSONResponse:
     metrics.webrtc_negotiations_total.inc()
 
     persona = state.personas.get(body.persona_id) if body.persona_id else None
-    orch = _make_orchestrator(persona)
-    await _load_persona_image(orch, persona)
-    await orch.start()
+    try:
+        orch = _make_orchestrator(persona)
+        await _load_persona_image(orch, persona)
+        await orch.start()
+    except Exception as e:
+        metrics.webrtc_negotiation_failures_total.inc()
+        logger.exception(f"orchestrator init failed: {e}")
+        raise HTTPException(500, f"orchestrator init failed: {e}")
+
+    from .webrtc.session import WebRTCSession  # noqa: PLC0415 — lazy import for test env
 
     session = WebRTCSession(state.settings, orch)
     state.sessions[session.id] = session
 
-    if not state.virtual_camera._task and state.settings.enable_virtual_camera:
+    if state.virtual_camera._task is None and state.settings.enable_virtual_camera:
         state.virtual_camera.attach(orch)
 
     try:
         answer = await session.offer(body.sdp, body.type)
-    except Exception:
+    except Exception as e:
         metrics.webrtc_negotiation_failures_total.inc()
         await session.close()
         state.sessions.pop(session.id, None)
-        raise
+        raise HTTPException(400, f"sdp negotiation failed: {e}")
     return JSONResponse({"id": session.id, **answer})
 
 
@@ -318,6 +380,7 @@ def main() -> None:
         port=settings.port,
         log_level=settings.log_level,
         reload=False,
+        timeout_graceful_shutdown=int(settings.shutdown_drain_s + 5),
     )
 
 

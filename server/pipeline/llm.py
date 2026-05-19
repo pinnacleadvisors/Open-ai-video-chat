@@ -69,17 +69,35 @@ class LLMSession:
         self.state.add_user(user_text)
         self._cancel = asyncio.Event()
         chunks: list[str] = []
+        log = logger.bind(session=self.session_id)
+
+        attempts = max(1, self.settings.llm_max_retries + 1)
+        backoff = self.settings.llm_retry_backoff_s
         try:
-            if self.settings.llm_backend == "ollama":
-                stream = self._stream_ollama()
-            else:
-                stream = self._stream_openai()
-            async for tok in stream:
-                if self._cancel.is_set():
-                    logger.bind(session=self.session_id).info("llm reply cancelled")
-                    break
-                chunks.append(tok)
-                yield tok
+            for attempt in range(1, attempts + 1):
+                try:
+                    stream = (
+                        self._stream_ollama() if self.settings.llm_backend == "ollama"
+                        else self._stream_openai()
+                    )
+                    async for tok in stream:
+                        if self._cancel.is_set():
+                            log.info("llm reply cancelled")
+                            return
+                        chunks.append(tok)
+                        yield tok
+                    return
+                except httpx.HTTPError as e:
+                    # Only safe to retry if we haven't emitted anything yet.
+                    if chunks or attempt == attempts:
+                        log.warning(f"llm stream failed after {len(chunks)} tokens: {e}")
+                        return
+                    delay = backoff * (2 ** (attempt - 1))
+                    log.warning(f"llm stream attempt {attempt} failed ({e}); retrying in {delay:.1f}s")
+                    await asyncio.sleep(delay)
+                except Exception as e:
+                    log.exception(f"llm stream errored: {e}")
+                    return
         finally:
             self.state.add_assistant("".join(chunks))
             self._cancel = None
