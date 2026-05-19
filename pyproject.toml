@@ -14,3 +14,27 @@ ignore = ["E501", "B008", "B904", "SIM105", "SIM117", "SIM108"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+follow_imports = "silent"
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = false
+# We're tightening incrementally — only the auth/middleware/rate-limit modules
+# are strict for now.
+files = [
+    "server/auth.py",
+    "server/middleware.py",
+    "server/rate_limit.py",
+    "server/personas_store.py",
+    "server/utils/fanout.py",
+    "server/utils/audio.py",
+    "server/utils/uploads.py",
+    "server/health_probes.py",
+    "server/lifecycle.py",
+    "server/metrics.py",
+    "server/pipeline/llm.py",
+    "server/pipeline/tts.py",
+]

@@ -155,32 +155,77 @@ All knobs live in `.env`. Notable groups:
 
 ## Production deployment
 
-- Set `AUTH_TOKEN` to a strong random value and `CORS_ORIGINS` to your
-  production domain. Public endpoints (`/api/health`, `/api/ready`,
-  `/api/metrics`) bypass auth.
-- Configure a TURN server (coturn, Twilio NTS, Cloudflare Realtime) via
-  `TURN_URL` etc. Production WebRTC will fail without one in many NAT
-  configurations.
-- Scrape `/api/metrics` from Prometheus. Useful series:
-  `oavc_sessions_active`, `oavc_utterances_total`,
-  `oavc_barge_ins_total`, `oavc_llm_ttft_seconds`,
-  `oavc_avatar_render_seconds`.
-- Front the server with nginx/Caddy for TLS termination.
-- For multi-replica deploys, scale Ollama horizontally and run one
-  avatar process per GPU; each process holds the model weights in VRAM.
+A reference reverse-proxy + TLS setup lives in `deploy/`:
+
+```bash
+# Put TLS certs in deploy/certs/{fullchain.pem,privkey.pem}, then:
+docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml up -d
+```
+
+This brings up nginx in front of the FastAPI server and Next.js
+frontend, terminates TLS, and proxies WebSocket upgrades to
+`/ws/transcripts/*`.
+
+### Production checklist
+
+- **Auth:** set `AUTH_TOKEN` to a strong random value. The token can be
+  rotated by reloading config (no restart needed — the middleware
+  re-reads it per request).
+- **CORS:** set `CORS_ORIGINS` to your real origin(s). Do not run with
+  wildcard in production.
+- **TURN:** set `TURN_URL`, `TURN_USERNAME`, `TURN_CREDENTIAL`.
+  Production WebRTC will fail without TURN in many NAT configurations.
+  Use coturn, Twilio NTS, or Cloudflare Realtime.
+- **HSTS:** set `ENABLE_HSTS=true` once TLS is confirmed working.
+- **Rate limits:** tune `RATE_LIMIT_OFFER_PER_MIN` and
+  `RATE_LIMIT_UPLOAD_PER_MIN` for your traffic. Limits are per client
+  IP (read from `X-Forwarded-For` when proxied).
+- **Readiness:** `/api/ready` actually probes Ollama, GPU presence,
+  and model-weight files. Use it as your k8s readiness probe.
+- **Graceful shutdown:** `SHUTDOWN_DRAIN_S` bounds how long the server
+  waits for in-flight sessions to close on SIGTERM. uvicorn's own
+  `--timeout-graceful-shutdown` is set to this + 5s.
+- **Observability:**
+  - Scrape `/api/metrics` from Prometheus.
+  - Every log line carries `request_id` (from `X-Request-ID` header,
+    auto-generated if missing) and `session` (per-conversation).
+- **Security headers:** `X-Content-Type-Options`, `X-Frame-Options`,
+  `Referrer-Policy`, `Permissions-Policy` are added by default.
+  Configure a CSP at the reverse proxy level (deploy-specific).
+
+### Useful Prometheus series
+
+```
+oavc_sessions_active           gauge       live WebRTC sessions
+oavc_utterances_total          counter     user utterances transcribed
+oavc_barge_ins_total           counter     mid-reply interruptions
+oavc_llm_ttft_seconds          histogram   time-to-first-token
+oavc_avatar_render_seconds     histogram   per-chunk lip-sync render time
+oavc_webrtc_negotiations_total counter     SDP offers accepted
+oavc_webrtc_negotiation_failures_total  counter
+```
+
+### Scaling
+
+For multi-replica deploys, scale Ollama horizontally and run one
+avatar process per GPU — each process holds the model weights in VRAM.
+The persona SQLite store is local; switch to Postgres if you need
+multi-replica persona sharing (the `PersonaStore` interface is small
+and trivial to swap).
 
 ## Development
 
 ```bash
-# Python lint + tests
+# Python lint + typecheck + tests
 python -m ruff check server tests scripts
+python -m mypy --config-file pyproject.toml
 python -m pytest tests/ -q
 
 # Frontend typecheck + build
 ( cd web && npx tsc --noEmit && npm run build )
 ```
 
-CI runs all four on every PR (`.github/workflows/ci.yml`).
+CI runs all five on every PR (`.github/workflows/ci.yml`).
 
 ## License
 

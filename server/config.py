@@ -53,6 +53,18 @@ class Settings(BaseSettings):
     )
     llm_temperature: float = 0.7
     llm_max_tokens: int = 256
+    llm_max_retries: int = 1
+    llm_retry_backoff_s: float = 0.4
+
+    # Rate limits (requests per minute per client IP)
+    rate_limit_offer_per_min: int = 30
+    rate_limit_upload_per_min: int = 10
+
+    # Graceful shutdown
+    shutdown_drain_s: float = 15.0
+
+    # HSTS toggle (enable when serving over HTTPS)
+    enable_hsts: bool = False
 
     # TTS
     tts_backend: Literal["piper", "xtts"] = "piper"

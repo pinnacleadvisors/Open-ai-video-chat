@@ -1,0 +1,44 @@
+# Production-flavoured compose: adds nginx for TLS termination, depends on
+# the same server/web images as the root docker-compose.yml.
+#
+# Bring up:
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml up -d
+#
+# Requirements:
+# - Drop fullchain.pem + privkey.pem into ./deploy/certs/ (e.g. from certbot)
+# - Set AUTH_TOKEN to a strong random value in .env
+# - Set CORS_ORIGINS to your public hostname
+# - Set TURN_URL/TURN_USERNAME/TURN_CREDENTIAL (production WebRTC needs TURN)
+# - Set ENABLE_HSTS=true once you've verified TLS works
+
+services:
+  server:
+    restart: unless-stopped
+    environment:
+      - ENABLE_HSTS=true
+    expose:
+      - "8000"
+    # Don't expose 8000 on the host — nginx handles ingress.
+    ports: !reset []
+
+  web:
+    restart: unless-stopped
+    expose:
+      - "3000"
+    ports: !reset []
+
+  ollama:
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/certs:/etc/nginx/certs:ro
+    depends_on:
+      - server
+      - web

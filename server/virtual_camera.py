@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 
 import numpy as np
 from loguru import logger
 
 from .config import Settings
-from .pipeline import Orchestrator
+
+if TYPE_CHECKING:
+    from .pipeline import Orchestrator
 
 
 class VirtualCameraPublisher:
