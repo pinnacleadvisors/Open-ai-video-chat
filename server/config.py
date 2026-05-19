@@ -7,7 +7,6 @@ from typing import Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -20,8 +19,20 @@ class Settings(BaseSettings):
     log_level: str = "info"
     device: Literal["cuda", "cpu", "mps"] = "cuda"
 
+    # Auth / CORS
+    auth_token: str = ""
+    cors_origins: str = "http://localhost:3000"
+
+    # Limits
+    max_image_upload_mb: int = 16
+    max_audio_upload_mb: int = 32
+    max_sessions: int = 16
+
     # WebRTC
-    ice_servers: str = "stun:stun.l.google.com:19302"
+    stun_url: str = "stun:stun.l.google.com:19302"
+    turn_url: str = ""
+    turn_username: str = ""
+    turn_credential: str = ""
 
     # STT
     stt_model: str = "large-v3-turbo"
@@ -69,9 +80,23 @@ class Settings(BaseSettings):
     root_dir: Path = Field(default=ROOT)
     models_dir: Path = Field(default=ROOT / "models" / "checkpoints")
     media_dir: Path = Field(default=ROOT / "media")
+    data_dir: Path = Field(default=ROOT / "data")
 
     def ice_server_list(self) -> list[dict]:
-        return [{"urls": url.strip()} for url in self.ice_servers.split(",") if url.strip()]
+        servers: list[dict] = []
+        if self.stun_url:
+            servers.append({"urls": self.stun_url})
+        if self.turn_url:
+            entry: dict = {"urls": self.turn_url}
+            if self.turn_username:
+                entry["username"] = self.turn_username
+            if self.turn_credential:
+                entry["credential"] = self.turn_credential
+            servers.append(entry)
+        return servers
+
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
     def avatar_path(self) -> Path:
         p = Path(self.avatar_image)

@@ -18,7 +18,6 @@ import numpy as np
 import torch
 from loguru import logger
 
-
 THIRD_PARTY = Path(__file__).resolve().parents[2] / "third_party" / "MuseTalk"
 if THIRD_PARTY.exists() and str(THIRD_PARTY) not in sys.path:
     sys.path.insert(0, str(THIRD_PARTY))
@@ -30,8 +29,8 @@ class MuseTalkRuntime:
             raise RuntimeError(
                 f"MuseTalk source missing at {THIRD_PARTY}. Run scripts/setup.sh."
             )
-        from musetalk.utils.utils import load_all_model
         from musetalk.utils.preprocessing import get_landmark_and_bbox
+        from musetalk.utils.utils import load_all_model
         from musetalk.whisper.audio2feature import Audio2Feature
 
         self.device = device
@@ -54,8 +53,8 @@ class MuseTalkRuntime:
 
     @torch.no_grad()
     def prepare_reference(self, image_bgr: np.ndarray) -> dict:
-        from musetalk.utils.preprocessing import coord_placeholder
         from musetalk.utils.blending import get_image_prepare_material
+        from musetalk.utils.preprocessing import coord_placeholder
 
         rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         bbox, _ = self._get_bbox([rgb])

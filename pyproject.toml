@@ -1,0 +1,16 @@
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = ["third_party", "models", "media", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4"]
+ignore = ["E501", "B008", "B904", "SIM105", "SIM117", "SIM108"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]

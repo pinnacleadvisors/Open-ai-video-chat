@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import AsyncIterator, Optional
 
 import numpy as np
 from loguru import logger
 
 from ..config import Settings
-
 
 SAMPLE_RATE = 16_000
 FRAME_MS = 30
@@ -24,15 +23,14 @@ class Utterance:
     is_final: bool
 
 
-class _SileroVAD:
-    """Thin wrapper around silero-vad with a sticky state machine."""
+class VADStateMachine:
+    """Endpointing on top of a frame-level voicedness signal.
+
+    Pure-Python, no model dependency — `voiced` is a function of the
+    probability stream coming from Silero. Pulled out so it can be unit-tested.
+    """
 
     def __init__(self, threshold: float, silence_ms: int):
-        import torch
-        from silero_vad import load_silero_vad
-
-        self._torch = torch
-        self.model = load_silero_vad(onnx=False)
         self.threshold = threshold
         self.silence_frames_needed = max(1, silence_ms // FRAME_MS)
         self.reset()
@@ -42,15 +40,10 @@ class _SileroVAD:
         self.silence_streak = 0
         self.voiced_streak = 0
 
-    def step(self, pcm_f32: np.ndarray) -> tuple[bool, bool]:
+    def step(self, prob: float) -> tuple[bool, bool]:
         """Returns (is_voiced_now, just_ended_utterance)."""
-        tensor = self._torch.from_numpy(pcm_f32)
-        with self._torch.no_grad():
-            prob = float(self.model(tensor, SAMPLE_RATE).item())
-
         voiced = prob >= self.threshold
         ended = False
-
         if voiced:
             self.voiced_streak += 1
             self.silence_streak = 0
@@ -64,57 +57,45 @@ class _SileroVAD:
                     ended = True
                     self.speaking = False
                     self.silence_streak = 0
-
         return voiced, ended
 
 
-class STT:
-    """faster-whisper STT with Silero VAD endpointing.
+class STTSession:
+    """Per-conversation STT state.
 
-    Feed 16 kHz mono float32 PCM in 30 ms frames via `push_pcm`. Consume
-    finalized utterances via `stream()`.
+    `engine.whisper` and `engine.vad` are loaded once at process start; this
+    object only holds the streaming buffers + state machine + result queue.
     """
 
-    def __init__(self, settings: Settings):
-        from faster_whisper import WhisperModel
+    def __init__(self, settings: Settings, whisper, vad_model, session_id: str):
+        import torch
 
-        device = settings.device
-        compute_type = settings.stt_compute_type
-        if device == "cpu" and compute_type == "float16":
-            compute_type = "int8"
-
-        logger.info(f"loading faster-whisper {settings.stt_model} on {device} ({compute_type})")
-        self.model = WhisperModel(
-            settings.stt_model,
-            device=device if device != "mps" else "cpu",
-            compute_type=compute_type,
-            download_root=str(settings.models_dir / "whisper"),
-        )
-        self.language: Optional[str] = None if settings.stt_language == "auto" else settings.stt_language
-        self.vad = _SileroVAD(settings.vad_threshold, settings.vad_silence_ms)
-
+        self._torch = torch
+        self.whisper = whisper
+        self.vad_model = vad_model
+        self.session_id = session_id
+        self.language: str | None = None if settings.stt_language == "auto" else settings.stt_language
+        self.vad = VADStateMachine(settings.vad_threshold, settings.vad_silence_ms)
         self._buffer: deque[np.ndarray] = deque()
         self._buffer_samples = 0
         self._utterance: list[np.ndarray] = []
         self._utterance_queue: asyncio.Queue[Utterance] = asyncio.Queue()
         self._voiced_event = asyncio.Event()
+        self._tasks: set[asyncio.Task] = set()
 
     @property
     def voiced(self) -> bool:
         return self.vad.speaking
 
     async def voiced_signal(self) -> None:
-        """Wake every time the VAD transitions to voiced. Used for barge-in."""
         await self._voiced_event.wait()
         self._voiced_event.clear()
 
     def push_pcm(self, pcm_f32: np.ndarray) -> None:
-        """Push 16 kHz mono float32 PCM of arbitrary length."""
         if pcm_f32.ndim > 1:
             pcm_f32 = pcm_f32.mean(axis=-1)
         self._buffer.append(pcm_f32.astype(np.float32, copy=False))
         self._buffer_samples += pcm_f32.shape[0]
-
         while self._buffer_samples >= FRAME_SAMPLES:
             frame = self._take_frame()
             self._process_frame(frame)
@@ -126,7 +107,7 @@ class STT:
             head = self._buffer[0]
             need = FRAME_SAMPLES - filled
             if head.shape[0] <= need:
-                out[filled:filled + head.shape[0]] = head
+                out[filled : filled + head.shape[0]] = head
                 filled += head.shape[0]
                 self._buffer.popleft()
                 self._buffer_samples -= head.shape[0]
@@ -138,34 +119,44 @@ class STT:
         return out
 
     def _process_frame(self, frame: np.ndarray) -> None:
-        voiced, ended = self.vad.step(frame)
+        tensor = self._torch.from_numpy(frame)
+        with self._torch.no_grad():
+            prob = float(self.vad_model(tensor, SAMPLE_RATE).item())
+        voiced, ended = self.vad.step(prob)
+
         if self.vad.speaking and not self._voiced_event.is_set():
             self._voiced_event.set()
-
         if self.vad.speaking or voiced:
             self._utterance.append(frame)
         if ended and self._utterance:
             audio = np.concatenate(self._utterance)
             self._utterance.clear()
-            asyncio.create_task(self._transcribe(audio))
+            self._spawn(self._transcribe(audio))
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     async def _transcribe(self, audio: np.ndarray) -> None:
         duration = audio.shape[0] / SAMPLE_RATE
-        if duration < 0.3:
+        if duration < 0.3 or duration > 30.0:
             return
         loop = asyncio.get_running_loop()
         try:
             text, lang = await loop.run_in_executor(None, self._run_whisper, audio)
         except Exception as e:
-            logger.exception(f"whisper failed: {e}")
+            logger.bind(session=self.session_id).exception(f"whisper failed: {e}")
             return
         text = text.strip()
         if not text:
             return
-        await self._utterance_queue.put(Utterance(text=text, language=lang, duration_s=duration, is_final=True))
+        await self._utterance_queue.put(
+            Utterance(text=text, language=lang, duration_s=duration, is_final=True)
+        )
 
     def _run_whisper(self, audio: np.ndarray) -> tuple[str, str]:
-        segments, info = self.model.transcribe(
+        segments, info = self.whisper.transcribe(
             audio,
             language=self.language,
             beam_size=1,
@@ -178,3 +169,12 @@ class STT:
     async def stream(self) -> AsyncIterator[Utterance]:
         while True:
             yield await self._utterance_queue.get()
+
+    async def close(self) -> None:
+        for t in list(self._tasks):
+            t.cancel()
+        for t in list(self._tasks):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass

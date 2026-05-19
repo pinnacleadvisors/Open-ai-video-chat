@@ -51,3 +51,9 @@ loguru==0.7.2
 orjson==3.10.11
 websockets==13.1
 aiofiles==24.1.0
+prometheus-client==0.21.0
+
+# Dev / tests
+pytest==8.3.3
+pytest-asyncio==0.24.0
+ruff==0.7.1

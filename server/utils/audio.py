@@ -8,6 +8,7 @@ def resample(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     if src_sr == dst_sr:
         return audio.astype(np.float32, copy=False)
     from math import gcd
+
     from scipy.signal import resample_poly
 
     g = gcd(src_sr, dst_sr)

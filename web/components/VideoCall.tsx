@@ -6,7 +6,7 @@ import { connectTranscripts, TranscriptEvent } from "@/lib/api";
 
 type ChatLine = { id: number; role: "user" | "assistant"; text: string };
 
-export function VideoCall() {
+export function VideoCall({ personaId }: { personaId?: string }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const callRef = useRef<CallHandle | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -36,16 +36,16 @@ export function VideoCall() {
   const begin = async () => {
     setError(null);
     try {
-      const call = await startCall();
+      const call = await startCall({ personaId });
       callRef.current = call;
       if (videoRef.current) {
         videoRef.current.srcObject = call.remoteStream;
         await videoRef.current.play().catch(() => {});
       }
-      wsRef.current = connectTranscripts(handleTranscript);
+      wsRef.current = connectTranscripts(call.sessionId, handleTranscript);
       setCalling(true);
-    } catch (e: any) {
-      setError(e?.message || String(e));
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
     }
   };
 
