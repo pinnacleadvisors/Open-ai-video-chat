@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.local
+
+# Node
+node_modules/
+.next/
+out/
+.turbo/
+*.log
+
+# Models / checkpoints
+models/checkpoints/
+models/cache/
+*.pt
+*.onnx
+*.safetensors
+*.bin
+!web/**/*.bin
+
+# Media artifacts
+media/uploads/
+media/output/
+*.wav
+*.mp4
+*.mp3
+!web/public/**
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Runtime
+*.pid
+*.sock
+data/
